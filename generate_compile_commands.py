@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Generate a compile_commands.json file for the workspace.
 
-Usage: generate-compile-commands [targets...]
+Usage: generate-compile-commands [bazel_flags] [targets...]
 """
 
+import itertools
 import json
 import os
 import subprocess
@@ -18,7 +19,8 @@ WORKSPACE_ENV_VARIABLE = "BUILD_WORKSPACE_DIRECTORY"
 #: See https://clang.llvm.org/docs/JSONCompilationDatabase.html
 COMPILE_COMMANDS = "compile_commands.json"
 
-INCLUDE_FLAGS = frozenset({"-I", "-iquote", "-isystem"})
+TEMPLATE_EXTENSIONS = [".inl", ".tcc"]
+HEADER_EXTENSIONS = [".hh", ".hpp", ".h"]
 
 
 def find_workspace() -> Path:
@@ -54,7 +56,6 @@ def process_action(action: dict, workspace: PurePath) -> dict:
     output = None
     source = None
     arguments = action["arguments"]
-    processed_arguments = list(arguments)
 
     # Try to find the main source file and output of the given translation unit.
     index = 0
@@ -68,23 +69,13 @@ def process_action(action: dict, workspace: PurePath) -> dict:
             index += 1
         index += 1
 
-    # Rewrite the include paths so that external points to bazel-out/external
-    is_include = False
-    for i, argument in enumerate(arguments):
-        if is_include:
-            is_include = False
-            if argument.startswith("external/"):
-                processed_arguments[i] = f"bazel-out/{argument}"
-        else:
-            is_include = argument in INCLUDE_FLAGS
-
     assert output is not None, "Failed out detect action output"
     assert source is not None, "Failed out detect action input"
 
     return {
-        "directory": str(workspace),
-        "file": source,
-        "arguments": list(processed_arguments),
+        "directory": str(workspace / f"bazel-{workspace.name}"),
+        "file": str(workspace / source),
+        "arguments": list(arguments),
         "output": output,
     }
 
@@ -92,15 +83,14 @@ def process_action(action: dict, workspace: PurePath) -> dict:
 def main(argv: List[str]):
     """The main CLI entrypoint."""
     workspace = find_workspace()
-    targets = " ".join(argv) if argv else "//..."
+    flags = list(itertools.takewhile(lambda x: x.startswith("-"), argv))
+    targets = argv[len(flags) :] if len(argv) > len(flags) else ["//..."]
+    subtracted_targets = " ".join(target[1:] for target in targets if target.startswith("-"))
+    selected_targets = " ".join((target for target in targets if not target.startswith("-")))
+
+    flags.append(f"mnemonic(CppCompile, set({selected_targets}) - set({subtracted_targets}))")
     result = subprocess.run(
-        [
-            os.environ.get("BAZEL_REAL", "bazel"),
-            "aquery",
-            "--output=jsonproto",
-            "--include_commandline",
-            f"mnemonic(CppCompile, set({targets}))",
-        ],
+        [os.environ.get("BAZEL_REAL", "bazel"), "aquery", "--output=jsonproto", "--include_commandline"] + flags,
         cwd=workspace,
         stdout=subprocess.PIPE,
         universal_newlines=True,
@@ -110,7 +100,23 @@ def main(argv: List[str]):
 
     action_graph = json.loads(result.stdout)
 
-    entries = [process_action(action, workspace) for action in action_graph["actions"]]
+    entries = [process_action(action, workspace) for action in action_graph.get("actions", [])]
+    entries_by_filename = {Path(entry["file"]): entry for entry in entries}
+
+    # Add entries for template implementation files
+    for file_path, entry in entries_by_filename.items():
+        for inl_extension in TEMPLATE_EXTENSIONS:
+            inl_file = file_path.with_suffix(inl_extension)
+            if (workspace / inl_file).exists() and inl_file not in entries_by_filename:
+                inl_entry = dict(entry)
+                inl_entry["file"] = str(inl_file)
+                del inl_entry["output"]
+                for header_extension in HEADER_EXTENSIONS:
+                    header_file = inl_file.with_suffix(header_extension)
+                    if (workspace / header_file).exists():
+                        inl_entry["arguments"].extend(["-include", str(header_file)])
+                        break
+                entries.append(inl_entry)
 
     with (workspace / COMPILE_COMMANDS).open("w") as compile_commands_file:
         json.dump(entries, compile_commands_file, indent=4)
