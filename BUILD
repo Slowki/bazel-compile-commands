@@ -1,3 +1,5 @@
+load("@rules_python//python:defs.bzl", "py_binary")
+
 py_binary(
     name = "generate_compile_commands",
     srcs = ["generate_compile_commands.py"],
