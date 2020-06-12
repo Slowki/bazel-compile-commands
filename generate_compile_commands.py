@@ -9,7 +9,6 @@ import json
 import os
 import subprocess
 import sys
-import tempfile
 from pathlib import Path, PurePath
 from typing import List
 
@@ -21,6 +20,8 @@ COMPILE_COMMANDS = "compile_commands.json"
 
 TEMPLATE_EXTENSIONS = [".inl", ".tcc"]
 HEADER_EXTENSIONS = [".hh", ".hpp", ".h"]
+
+INCLUDE_FLAG = frozenset({"-I", "-iquote", "-isystem"})
 
 
 def find_workspace() -> Path:
@@ -56,6 +57,7 @@ def process_action(action: dict, workspace: PurePath) -> dict:
     output = None
     source = None
     arguments = action["arguments"]
+    include_directories = []
 
     # Try to find the main source file and output of the given translation unit.
     index = 0
@@ -63,18 +65,37 @@ def process_action(action: dict, workspace: PurePath) -> dict:
         argument = arguments[index]
         if argument == "-c":
             source = arguments[index + 1]
+            arguments[index + 1] = os.fspath(workspace / source)
             index += 1
         elif argument == "-o":
             output = arguments[index + 1]
             index += 1
+        elif argument in INCLUDE_FLAG:
+            include_directories.append((argument, arguments[index + 1]))
+            index += 1
+        else:
+            include = next(((flag, argument[len(flag) :]) for flag in INCLUDE_FLAG if argument.startswith(flag)), None,)
+            if include:
+                include_directories.append(include)
+
         index += 1
 
     assert output is not None, "Failed out detect action output"
     assert source is not None, "Failed out detect action input"
 
+    for flag, include_dir in include_directories:
+        # Look in both the workspace and the exec root for non-external and non-generated headers.
+        if include_dir[0] != "/" and not include_dir.startswith("bazel-") and not include_dir.startswith("external/"):
+            arguments.extend((flag, os.fspath(workspace / include_dir)))
+
+    execroot = workspace / f"bazel-{workspace.name}"
+    source_file = workspace / source
+    if not source_file.exists():
+        source_file = execroot / source
+
     return {
-        "directory": str(workspace / f"bazel-{workspace.name}"),
-        "file": str(workspace / source),
+        "directory": os.fspath(execroot),
+        "file": os.fspath(source_file),
         "arguments": list(arguments),
         "output": output,
     }
