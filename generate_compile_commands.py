@@ -23,6 +23,15 @@ HEADER_EXTENSIONS = [".hh", ".hpp", ".h"]
 
 INCLUDE_FLAG = frozenset({"-I", "-iquote", "-isystem"})
 
+BAZEL = os.environ.get("BAZEL_REAL", "bazel")
+
+
+def bazel_info(key: str) -> str:
+    bazel_result = subprocess.run(
+        [BAZEL, "info", key], stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True,
+    )
+    return bazel_result.stdout.strip()
+
 
 def find_workspace() -> Path:
     """Find the root of the current Bazel workspace."""
@@ -36,15 +45,9 @@ def find_workspace() -> Path:
         if (directory / "WORKSPACE").exists():
             return directory
 
-    # Fall back to using the root of the git repo if available.
+    # Fall back to using a subprocess
     try:
-        git_result = subprocess.run(
-            ["git", "rev-parse", "--show-toplevel"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            universal_newlines=True,
-        )
-        return Path(git_result.stdout.strip())
+        return Path(bazel_info("workspace"))
     except subprocess.CalledProcessError:
         pass
 
@@ -52,8 +55,20 @@ def find_workspace() -> Path:
     return Path.cwd()
 
 
-def process_action(action: dict, workspace: PurePath) -> dict:
+def rewrite_include(include: str, execroot_external: str, output_base: PurePath) -> str:
+    EXTERNAL = "external/"
+
+    if include.startswith(execroot_external):
+        return os.fspath(output_base / "external" / include[len(execroot_external) :])
+    if include.startswith(EXTERNAL):
+        return os.fspath(output_base / "external" / include[len(EXTERNAL) :])
+    return include
+
+
+def process_action(action: dict, workspace: PurePath, output_base: PurePath) -> dict:
     """Process an individual action into a compilation database entry."""
+    execroot = workspace / f"bazel-{workspace.name}"
+    execroot_external = os.fspath(execroot / "external")
     output = None
     source = None
     arguments = action["arguments"]
@@ -71,11 +86,13 @@ def process_action(action: dict, workspace: PurePath) -> dict:
             output = arguments[index + 1]
             index += 1
         elif argument in INCLUDE_FLAG:
+            arguments[index + 1] = rewrite_include(arguments[index + 1], execroot_external, output_base)
             include_directories.append((argument, arguments[index + 1]))
             index += 1
         else:
-            include = next(((flag, argument[len(flag) :]) for flag in INCLUDE_FLAG if argument.startswith(flag)), None,)
+            include = next(((flag, argument[len(flag) :]) for flag in INCLUDE_FLAG if argument.startswith(flag)), None)
             if include:
+                arguments[index] = include[0] + rewrite_include(include[1], execroot_external, output_base)
                 include_directories.append(include)
 
         index += 1
@@ -88,7 +105,6 @@ def process_action(action: dict, workspace: PurePath) -> dict:
         if include_dir[0] != "/" and not include_dir.startswith("bazel-") and not include_dir.startswith("external/"):
             arguments.extend((flag, os.fspath(workspace / include_dir)))
 
-    execroot = workspace / f"bazel-{workspace.name}"
     source_file = workspace / source
     if not source_file.exists():
         source_file = execroot / source
@@ -111,7 +127,7 @@ def main(argv: List[str]):
 
     flags.append(f"mnemonic(CppCompile, set({selected_targets}) - set({subtracted_targets}))")
     result = subprocess.run(
-        [os.environ.get("BAZEL_REAL", "bazel"), "aquery", "--output=jsonproto", "--include_commandline"] + flags,
+        [BAZEL, "aquery", "--output=jsonproto", "--include_commandline"] + flags,
         cwd=workspace,
         stdout=subprocess.PIPE,
         universal_newlines=True,
@@ -121,7 +137,8 @@ def main(argv: List[str]):
 
     action_graph = json.loads(result.stdout)
 
-    entries = [process_action(action, workspace) for action in action_graph.get("actions", [])]
+    output_base = Path(bazel_info("output_base"))
+    entries = [process_action(action, workspace, output_base) for action in action_graph.get("actions", [])]
     entries_by_filename = {Path(entry["file"]): entry for entry in entries}
 
     # Add entries for template implementation files
